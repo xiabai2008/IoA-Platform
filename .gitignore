@@ -37,6 +37,7 @@ backend/config.yaml
 
 # Local tools
 .claude/
+.workbuddy/
 clean/
 
 # OS
