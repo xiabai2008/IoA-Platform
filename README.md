@@ -53,6 +53,42 @@
 
 ---
 
+## 界面预览
+
+以下截图均取自本平台**实际运行**：`python run.py` 启动后，通过 API 注入真实故障、下发真实自然语言指令触发完整 DAG 流程，并在运行中的 GUI 上截取——非设计稿、非示意图。
+
+### 1. 控制台总览
+
+<img src="docs/screenshots/01-overview.png" alt="IoA 平台控制台总览" width="900">
+
+网络拓扑、四域实时指标（延迟/丢包/带宽）、Agent 集群（9 实例 / 5 类型）、DAG 执行记录、延迟趋势与 IoAP 消息流同屏呈现。
+
+### 2. 故障注入
+
+<img src="docs/screenshots/02-fault-injected.png" alt="华东链路拥塞故障注入" width="900">
+
+向华东域注入链路拥塞：拓扑链路高亮告警（1 个活跃故障），华东延迟由基线 ~15ms 升至 213ms、带宽占用 94%，延迟趋势曲线同步抬升。
+
+### 3. 全链路闭环修复
+
+<img src="docs/screenshots/03-closed-loop.png" alt="自然语言指令驱动的全链路闭环修复" width="900">
+
+下发自然语言指令「华东链路拥塞，请全流程诊断修复」，Orchestrator 自动编排 `full_remediation` DAG —— monitor → diagnose → repair → verify → report 五节点依次执行，完成后活跃故障清零、华东延迟回落至 16.3ms。延迟趋势图完整记录「故障抬升 → 修复回落」全过程。
+
+### 4. 多域并发故障
+
+<img src="docs/screenshots/04-multi-domain-fault.png" alt="三域并发链路拥塞" width="900">
+
+华东 / 华北 / 华南三域接入链路同时注入拥塞：拓扑出现 3 个活跃故障，三域指标同步红色告警（延迟 189.9 / 240.3 / 218.7 ms，带宽占用 94–96%），而**未被注入故障的西南域保持绿色正常**——验证分域感知与故障隔离能力。
+
+### 5. 多域协同修复
+
+<img src="docs/screenshots/05-multi-domain-remediation.png" alt="多域协同诊断修复" width="900">
+
+一条自然语言指令「华东、华北、华南三域链路拥塞，请全流程诊断修复」覆盖三域复合故障：MonitorAgent 逐域采集并聚合异常，RepairerAgent 按活跃故障逐条差异化修复，全部完成后活跃故障归零、四域指标回到基线，延迟趋势图三条曲线同步回落。
+
+---
+
 ## 核心创新点
 
 ### 1. 双层架构设计
@@ -213,33 +249,44 @@ full_remediation DAG 从注入故障到验证通过，端到端耗时约 **6秒*
 ```
 IoA 分布式网络运维协同平台/
 ├── backend/
-│   ├── ioa_middleware/        # IoA中间件核心
+│   ├── ioa_middleware/        # IoA 中间件核心
 │   │   ├── main.py            # FastAPI 应用入口
-│   │   ├── registry.py        # Agent注册中心
-│   │   ├── router.py          # 多维加权消息路由总线
-│   │   └── orchestrator/      # DAG调度引擎
-│   │       ├── scheduler.py   # Kahn拓扑排序
-│   │       └── templates.py   # DAG模板库
-│   ├── agents/                # Agent实现
-│   │   ├── __init__.py        # Agent工厂
-│   │   ├── base_agent.py      # 基类
-│   │   ├── orchestrator_agent.py
-│   │   ├── monitor_agent.py
-│   │   ├── diagnoser_agent.py
-│   │   ├── repairer_agent.py
-│   │   └── verifier_agent.py
+│   │   ├── mcp_server.py      # MCP SSE 服务（get_metrics / inject_fault 等工具）
+│   │   ├── a2a_server.py      # A2A 服务端（Agent Card + REST 端点）
+│   │   ├── registry/          # Agent 注册中心
+│   │   ├── router/            # 多维加权消息路由总线
+│   │   ├── verifier/          # 闭环验证（三态判定）
+│   │   └── orchestrator/      # DAG 调度引擎
+│   │       ├── scheduler.py   # Kahn 拓扑排序 + 重试策略
+│   │       └── templates.py   # DAG 模板库
+│   ├── agents/                # Agent 实现（各自独立包）
+│   │   ├── base_agent.py      # Agent 基类
+│   │   ├── tool_client.py     # MCP / HTTP 工具客户端
+│   │   ├── llm_client.py      # DeepSeek LLM 客户端
+│   │   ├── orchestrator_agent/
+│   │   ├── monitor_agent/
+│   │   ├── diagnoser_agent/
+│   │   ├── repairer_agent/
+│   │   ├── verifier_agent/
+│   │   └── reporter_agent/
 │   ├── simulator/             # 网络模拟器
-│   │   ├── api.py             # 模拟器API
-│   │   └── network.py         # 拓扑与流量模型
-│   ├── data/                  # SQLite数据库
-│   └── run.py                 # 一键启动
-├── gui/
-│   └── index.html             # 控制台（Material Symbols图标）
+│   │   ├── api.py             # 模拟器 API（端口 8001）
+│   │   ├── topology.py        # 网络拓扑定义
+│   │   ├── faults.py          # 故障注入与修复动作
+│   │   └── generator.py       # 指标生成器
+│   ├── requirements.txt
+│   └── run.py                 # 一键启动（中间件 8000 + 模拟器 8001 + MCP SSE 9000）
+├── gui/                       # 控制台前端
+│   ├── index.html             # 页面骨架（Material Symbols 图标）
+│   └── app.js                 # 拓扑图 / 指标 / DAG / 消息流渲染
 ├── docs/
-│   ├── ARCHITECTURE.md        # 架构设计文档
-│   ├── IOAP_PROTOCOL.md       # IoAP 协议规范
-│   └── DEMO_SCRIPT.md         # 演示视频脚本
-├── requirements.txt
+│   ├── awards/                # 获奖证书扫描件（人员姓名与证书编号已脱敏）
+│   ├── screenshots/           # 平台运行截图
+│   ├── agents/                # Agent 设计文档
+│   ├── 设计文档_B-EP1_IoA平台.docx
+│   └── 演示视频脚本.md
+├── tests/                     # 测试用例
+├── docker-compose.yml         # 容器化编排（中间件 / 模拟器 / Agent）
 └── README.md
 ```
 
