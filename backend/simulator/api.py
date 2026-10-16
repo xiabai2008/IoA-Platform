@@ -37,10 +37,19 @@ _ws_clients: list[WebSocket] = []
 
 @app.get("/simulator/metrics")
 async def get_metrics(domain: str | None = None):
-    """获取网络指标快照。可选 domain 参数过滤单个域。"""
-    if domain:
-        return {"ts_ms": int(time.time() * 1000), "metrics": get_domain_metrics(domain)}
-    return {"ts_ms": int(time.time() * 1000), "metrics": get_all_domain_metrics()}
+    """获取网络指标快照。
+
+    - 不传 domain，或传 global / all / 全域 → 返回全部域
+    - 传具体域 → 只返回该域
+
+    注意：global 必须映射为全量。早期实现把它当作普通域名查，
+    命中不到便返回空 {}，上游按"无指标即无异常"处理会导致整条全域
+    修复流程假成功。
+    """
+    ts = int(time.time() * 1000)
+    if domain and domain.strip().lower() not in ("global", "all", "全域"):
+        return {"ts_ms": ts, "metrics": get_domain_metrics(domain)}
+    return {"ts_ms": ts, "metrics": get_all_domain_metrics()}
 
 
 @app.get("/simulator/topology")

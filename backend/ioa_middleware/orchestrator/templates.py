@@ -123,7 +123,10 @@ def template_full_remediation(params: dict) -> dict:
                 "type": "repair",
                 "capability": "repair",
                 "depends_on": ["diagnose-1"],
-                "max_retries": 1,
+                # 修复节点每次只处理一个活跃故障，重试预算必须 >= 故障数。
+                # 原值 1 只能清 2 个故障，导致 GUI"复合故障"（注入 3 个）必然失败。
+                # 重试仅在节点失败时触发，无故障时修复节点直接跳过，不会浪费。
+                "max_retries": 4,
             },
             {
                 "node_id": "verify-1",
@@ -219,7 +222,8 @@ def template_full_remediation_all(params: dict) -> dict:
                 "capability": "repair",
                 "domain": domain,
                 "depends_on": [diag_id],
-                "max_retries": 1,
+                # 同 full_remediation/repair-1：重试预算需覆盖多故障
+                "max_retries": 4,
             },
             {
                 "node_id": verify_id,

@@ -65,11 +65,32 @@ class MonitorAgent(BaseAgent):
             )
 
             metrics = metrics_resp.get("metrics", {})
-            if isinstance(metrics, dict) and target_domain in metrics:
-                metrics = metrics[target_domain]
 
             # 2. 异常检测
-            anomalies = self._detect_anomalies(metrics)
+            # metrics 有两种形态：
+            #   - 单域：{"domain":..., "latency_ms":..., "packet_loss":...}
+            #   - 多域：{"east-china": {...}, "north-china": {...}, ...}（全域指令）
+            # 多域嵌套结构必须逐域检测再聚合。若直接交给扁平阈值检测，
+            # 每个指标取到的都是 None 被 continue 跳过，结果是 0 异常 →
+            # 跳过修复 → 验证判 pass 的"假成功"，全域指令会整条失效。
+            is_multi = target_domain == "global" or (
+                isinstance(metrics, dict)
+                and any(isinstance(v, dict) for v in metrics.values())
+            )
+            if is_multi:
+                per_domain: dict = {}
+                anomalies: list[dict] = []
+                for d, mv in (metrics or {}).items():
+                    if not isinstance(mv, dict):
+                        continue
+                    per_domain[d] = mv
+                    for a in self._detect_anomalies(mv):
+                        anomalies.append({**a, "domain": d})
+                metrics = per_domain
+            else:
+                if isinstance(metrics, dict) and target_domain in metrics:
+                    metrics = metrics[target_domain]
+                anomalies = self._detect_anomalies(metrics)
 
             result = {
                 "success": True,

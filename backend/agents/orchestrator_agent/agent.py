@@ -75,14 +75,20 @@ class OrchestratorAgent(BaseAgent):
         return entry
 
     def _store_cache(self, user_input: str, dag_id: str, template_name: str,
-                     diagnosis_summary: str, elapsed_ms: int) -> None:
-        """缓存已完成的场景结果。"""
+                     diagnosis_summary: str, elapsed_ms: int,
+                     params: dict | None = None) -> None:
+        """缓存已完成的场景结果。
+
+        params 必须一并缓存：缓存命中时要用同一套参数重新提交 DAG。
+        只复用 dag_id 是不行的——上一个 DAG 早已执行完毕，不会触发新流程。
+        """
         key = self._cache_key(user_input)
         self._scenario_cache[key] = {
             "dag_id": dag_id,
             "template": template_name,
             "diagnosis": diagnosis_summary,
             "elapsed_ms": elapsed_ms,
+            "params": dict(params or {}),
             "cached_at": time.time(),
         }
         # 限制缓存大小
@@ -144,16 +150,40 @@ class OrchestratorAgent(BaseAgent):
                 logger.exception("[%s] Failed to submit DAG: %s", self.agent_id, e)
                 return {"success": False, "error": str(e)}
 
-        # ── 场景缓存：相同指令秒级响应 ──
+        # ── 场景缓存：相同指令跳过 LLM 意图解析 ──
         cached = self._lookup_cache(user_input)
         if cached:
             cached_at_ago = int(time.time() - cached["cached_at"])
-            logger.info("[%s] Cache hit for: %s... (score=%.2f, cached %ds ago, dag=%s)", self.agent_id, user_input[:40], cached[1], cached_at_ago, cached['dag_id'])
+            cached_template = cached["template"]
+            logger.info(
+                "[%s] Cache hit for: %s... (template=%s, cached %ds ago, prev_dag=%s)",
+                self.agent_id, user_input[:40], cached_template, cached_at_ago,
+                cached["dag_id"],
+            )
+            # 缓存只省掉 LLM 意图解析这一步，DAG 仍必须重新提交：
+            # 上一个 DAG 已经跑完，直接返回它的 dag_id 不会触发任何新流程。
+            try:
+                if cached_template not in TEMPLATES:
+                    raise KeyError(f"cached template not in TEMPLATES: {cached_template}")
+                dag_def = TEMPLATES[cached_template]["fn"](dict(cached.get("params") or {}))
+                resp = await self._dag_http.post(
+                    self._dag_url, json=dag_def, headers=self._auth)
+                resp.raise_for_status()
+                new_dag_id = resp.json().get("dag_id", dag_def.get("dag_id", ""))
+            except Exception as e:
+                logger.exception("[%s] Cache-hit resubmit failed: %s", self.agent_id, e)
+                return {"success": False, "error": str(e)}
+
+            logger.info("[%s] Cache hit → resubmitted DAG %s (%s)",
+                        self.agent_id, new_dag_id, cached_template)
+            self._store_cache(user_input, new_dag_id, cached_template,
+                              cached["diagnosis"], cached["elapsed_ms"],
+                              cached.get("params"))
             return {
                 "success": True,
                 "output": {
-                    "dag_id": cached["dag_id"],
-                    "template": cached["template"],
+                    "dag_id": new_dag_id,
+                    "template": cached_template,
                     "user_input": user_input,
                     "cached": True,
                     "diagnosis": cached["diagnosis"],
@@ -161,8 +191,7 @@ class OrchestratorAgent(BaseAgent):
                     "message": (
                         f"[缓存命中] 相同场景 {cached_at_ago}s 前已处理完毕。"
                         f"诊断: {cached['diagnosis']}。"
-                        f"上次耗时: {cached['elapsed_ms']/1000:.1f}s。"
-                        f"正在提交新的修复流程..."
+                        f"已提交新的修复流程 DAG {new_dag_id}。"
                     ),
                 },
             }
@@ -226,8 +255,8 @@ class OrchestratorAgent(BaseAgent):
                     "message": f"DAG {dag_id} 已提交（模板: {template_name}），正在执行中...",
                 },
             }
-            # 缓存场景结果（下次相同指令秒级响应）
-            self._store_cache(user_input, dag_id, template_name, diagnosis_summary, 0)
+            # 缓存场景结果（下次相同指令跳过 LLM 意图解析）
+            self._store_cache(user_input, dag_id, template_name, diagnosis_summary, 0, dag_params)
             logger.info("[%s] DAG %s submitted (%s)", self.agent_id, dag_id, template_name)
         except Exception as e:
             result = {

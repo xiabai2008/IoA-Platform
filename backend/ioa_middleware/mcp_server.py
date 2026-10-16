@@ -101,7 +101,11 @@ def create_mcp_server(sim_url: str = "http://127.0.0.1:8001") -> Server:
                     "properties": {
                         "domain": {
                             "type": "string",
-                            "description": "域名，如 east-china。留空返回全部域",
+                            "description": "域名，如 east-china。留空或传 global 返回全部域",
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "domain 的别名（HttpToolClient 使用该键名）",
                         }
                     },
                 },
@@ -179,7 +183,11 @@ def create_mcp_server(sim_url: str = "http://127.0.0.1:8001") -> Server:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         handler = {
-            "get_metrics": lambda: sim.get_metrics(arguments.get("domain", "")),
+            "get_metrics": lambda: sim.get_metrics(
+                # 兼容两种键名：HttpToolClient 用 region，本 schema 与模拟器用 domain。
+                # 只认 domain 会导致 {"region": ...} 被解析为空串 → 静默返回全量域。
+                arguments.get("domain") or arguments.get("region") or ""
+            ),
             "get_all_metrics": lambda: sim.get_metrics(""),
             "get_topology": sim.get_topology,
             "inject_fault": lambda: sim.inject_fault(
@@ -213,6 +221,29 @@ async def main():
     server = create_mcp_server()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
+
+
+class _RawAsgiHandler:
+    """把基于 Request 的处理器直接作为 ASGI 端点，绕开 starlette 的 func(request)->response 包装。
+
+    背景：handle_post_message / connect_sse 这些底层 ASGI 处理器会自己把响应写进 send，
+    其返回值是 None。若让 starlette 用 request_response 包装，
+    它随后会执行 `await response(scope, receive, send)`——对 None 做调用，
+    于是每次请求/断流都抛 `TypeError: 'NoneType' object is not callable` 并刷一屏栈。
+    （客户端其实已收到正确响应，所以表现是"功能正常但日志爆炸"。）
+
+    传入的 handler 仍按 `async def handler(request: Request) -> None` 编写。
+    """
+
+    def __init__(self, handler):
+        self._handler = handler
+
+    async def __call__(self, scope, receive, send):
+        # 在本文件的既有风格下 Request 是各函数内部导入的局部名，
+        # 这里必须自行导入，不能用外层函数的局部变量。
+        from starlette.requests import Request
+        request = Request(scope, receive, send)
+        await self._handler(request)
 
 
 def create_mcp_sse_app(sim_url: str = "http://127.0.0.1:8001"):
@@ -260,8 +291,8 @@ def create_mcp_sse_app(sim_url: str = "http://127.0.0.1:8001"):
             await response(request.scope, request.receive, request._send)
 
     app = Starlette(routes=[
-        Route("/sse", endpoint=handle_sse),
-        Route("/messages", endpoint=handle_messages, methods=["POST"]),
+        Route("/sse", endpoint=_RawAsgiHandler(handle_sse)),
+        Route("/messages", endpoint=_RawAsgiHandler(handle_messages), methods=["POST"]),
     ])
     return app
 
@@ -306,8 +337,8 @@ async def start_mcp_server(sim_url: str = "http://127.0.0.1:8001"):
         )
 
     starlette_app = Starlette(routes=[
-        Route("/sse", handle_sse, methods=["GET"]),
-        Route("/messages", handle_messages, methods=["POST"]),
+        Route("/sse", _RawAsgiHandler(handle_sse), methods=["GET"]),
+        Route("/messages", _RawAsgiHandler(handle_messages), methods=["POST"]),
     ])
 
     # Force Connection: close on /messages to fix HTTP/1.1 keep-alive on Windows

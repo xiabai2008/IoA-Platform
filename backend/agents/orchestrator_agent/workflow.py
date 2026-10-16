@@ -12,6 +12,7 @@ LangGraph 为可选依赖，未安装时自动降级为顺序执行模式。
 
 import json
 import logging
+import re
 from typing import TypedDict, Annotated, Sequence
 from prompts import PROMPTS
 from operator import add as add_messages
@@ -43,30 +44,95 @@ class OrchestratorState(TypedDict):
     confidence: float  # 置信度
 
 
+# ── 域名规范化 ───────────────────────────────────────────
+#
+# 背景：LLM 遇到多域指令时会把 domain 输出成逗号拼接字符串
+# （实测："华东、华北、华南三域链路拥塞" → "east-china,north-china,south-china"），
+# 而 DAG 校验只接受单一域，原样提交会 422，整条指令静默失败。
+# 多域并发在语义上就等于全域协同，统一归为 "global"。
+
+VALID_DOMAINS = ("east-china", "north-china", "south-china", "west-china")
+
+DOMAIN_ALIASES = {
+    "华东": "east-china", "东部": "east-china",
+    "east": "east-china", "east-china": "east-china",
+    "华北": "north-china", "北部": "north-china",
+    "north": "north-china", "north-china": "north-china",
+    "华南": "south-china", "南部": "south-china",
+    "south": "south-china", "south-china": "south-china",
+    "西南": "west-china", "西部": "west-china", "华西": "west-china",
+    "west": "west-china", "west-china": "west-china",
+}
+
+GLOBAL_WORDS = ("global", "全域", "所有域", "全部域", "全局",
+                "所有地区", "全部地区", "所有故障", "全部故障")
+
+
+def domains_in_text(text: str) -> list[str]:
+    """扫描文本中出现的所有域（去重、保持发现顺序）。"""
+    low = (text or "").lower()
+    found: list[str] = []
+    for alias, d in DOMAIN_ALIASES.items():
+        if alias in low and d not in found:
+            found.append(d)
+    return found
+
+
+def normalize_domain(value, fallback: str = "east-china") -> str:
+    """把任意来源的 domain 值规范化为单一合法域。
+
+    - 命中全域词（全部/所有/global）→ "global"
+    - 解析出多个域 → "global"（多域并发即全域协同）
+    - 恰好一个域 → 该域
+    - 解析不出 → fallback（再由调用方按文本规则兜底）
+
+    同时接受 list/tuple 与 "a,b" / "a、b" / "a b" 等字符串形式。
+    """
+    if value is None:
+        return fallback
+
+    if isinstance(value, (list, tuple, set)):
+        tokens = [str(v) for v in value]
+    else:
+        raw = str(value)
+        low = raw.lower()
+        for w in GLOBAL_WORDS:
+            if w in low:
+                return "global"
+        tokens = re.split(r"[,，、;；/|\s]+", raw)
+
+    found: list[str] = []
+    for tok in tokens:
+        t = tok.strip().lower()
+        if not t:
+            continue
+        if t in GLOBAL_WORDS:
+            return "global"
+        d = DOMAIN_ALIASES.get(t)
+        if d and d not in found:
+            found.append(d)
+
+    if len(found) > 1:
+        return "global"
+    if len(found) == 1:
+        return found[0]
+    return fallback
+
+
 # ── 节点函数 ─────────────────────────────────────────────
 
 async def parse_intent_node(state: OrchestratorState, llm_client=None) -> dict:
     """意图解析节点 — 使用 LLM 提取结构化参数"""
     user_input = state["user_input"]
     
-    # 域名映射
-    domain_aliases = {
-        "华东": "east-china", "东部": "east-china", "east": "east-china",
-        "华北": "north-china", "北部": "north-china", "north": "north-china",
-        "华南": "south-china", "南部": "south-china", "south": "south-china",
-        "西南": "west-china", "西部": "west-china", "west": "west-china",
-    }
-    global_keywords = ["全域", "所有域", "全部域", "全局", "所有地区", "全部地区", "所有故障", "全部故障"]
-
-    # 提取域名
-    domain = "east-china"  # 默认
-    if any(kw in user_input for kw in global_keywords):
+    # 提取域名：命中全域词，或文本中出现多个域 → 全域协同
+    found_domains = domains_in_text(user_input)
+    if any(kw in user_input for kw in GLOBAL_WORDS) or len(found_domains) > 1:
         domain = "global"
+    elif len(found_domains) == 1:
+        domain = found_domains[0]
     else:
-        for alias, d in domain_aliases.items():
-            if alias in user_input.lower():
-                domain = d
-                break
+        domain = "east-china"  # 默认
     
     # 如果有 LLM，使用 LLM 增强解析
     if llm_client and llm_client.available:
@@ -81,7 +147,9 @@ async def parse_intent_node(state: OrchestratorState, llm_client=None) -> dict:
                     if response.startswith("json"):
                         response = response[4:]
                 parsed = json.loads(response.strip())
-                parsed.setdefault("domain", domain)
+                # LLM 可能返回多域拼接串（"east-china,north-china"）或非法值，
+                # 必须先规范化再入库，否则下游校验 422 会让整条指令静默失败。
+                parsed["domain"] = normalize_domain(parsed.get("domain"), fallback=domain)
                 return {
                     "intent": parsed,
                     "messages": [f"[意图解析] LLM 提取: {json.dumps(parsed, ensure_ascii=False)}"],
@@ -142,9 +210,11 @@ async def validate_params_node(state: OrchestratorState) -> dict:
     if not intent.get("domain"):
         errors.append("缺少 domain 参数")
 
-    # 域名有效性检查（global 用于全域模板，允许通过）
-    valid_domains = ["east-china", "north-china", "south-china", "west-china", "global"]
-    if intent.get("domain") not in valid_domains:
+    # 域名有效性检查：非法值先尝试规范化（多域拼接 → global），仍无法解析才报错
+    normalized = normalize_domain(intent.get("domain"), fallback="")
+    if normalized:
+        intent["domain"] = normalized
+    else:
         errors.append(f"无效的 domain: {intent.get('domain')}")
 
     return {
